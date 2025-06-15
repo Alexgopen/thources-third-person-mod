@@ -70,7 +70,10 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     float z = cameraOffset.getZ() - target.getZ();
                     double yaw = Math.atan2(z, x);
                     setPitch(world.getPlayerRotY());
-                    return (float) method.invoke(proxy, args) + Math.cos(Math.toRadians(pitch)) * Math.cos(yaw) * zoomFactor * -dist;
+                    
+                    double cameraX = (float) method.invoke(proxy, args) + Math.cos(Math.toRadians(pitch)) * Math.cos(yaw) * zoomFactor * -dist;
+                    
+                    return cameraX;
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
@@ -84,7 +87,9 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
 
                     setPitch(world.getPlayerRotY());
 
-                    return world.getPlayerPosH() + 1.5f + Math.sin(Math.toRadians(getClampedPitch())) * zoomFactor * dist;
+                    double cameraY = world.getPlayerPosH() + 1.5f + Math.sin(Math.toRadians(pitch)) * zoomFactor * dist;
+                    
+                    return cameraY;
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
@@ -105,7 +110,10 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     float z = cameraOffset.getZ() - target.getZ();
                     double yaw = Math.atan2(z, x);
                     setPitch(world.getPlayerRotY());
-                    return (float) method.invoke(proxy, args) + Math.sin(yaw) * Math.cos(Math.toRadians(pitch)) * zoomFactor * -dist;
+                    
+                    double cameraZ = (float) method.invoke(proxy, args) + Math.sin(yaw) * Math.cos(Math.toRadians(pitch)) * zoomFactor * -dist;
+                    
+                    return cameraZ;
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.model.collada.animation.ColladaAnimation", "getAnimateCamera", null, () -> (proxy, method, args) -> {
@@ -117,16 +125,34 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
         ModConsole.addConsoleListener(this);
     }
 
-    public void addZoom(float factor) {
-        setZoom(zoomFactor + factor);
-    }
-
     public void setZoom(float factor) {
         zoomFactor = Math.max(ZOOM_MIN, Math.min(factor, ZOOM_MAX));
     }
 
     public void setPitch(float factor) {
         pitch = factor;
+    }
+    
+    public void zoomIn()
+    {
+    	float factor = 0.1f;
+    	factor = (ZOOM_MAX - ZOOM_MIN)/10f;
+    	setZoom(zoomFactor - factor);
+    	if (tpActive && this.zoomFactor == ZOOM_MIN)
+        {
+        	tpActive = false;
+        }
+    }
+    
+    public void zoomOut()
+    {
+    	float factor = 0.1f;
+    	factor = (ZOOM_MAX - ZOOM_MIN)/10f;
+    	if (!tpActive)
+        {
+        	tpActive = true;
+        }
+    	setZoom(zoomFactor + factor);
     }
 
     public void setXOffset(float factor) {
@@ -162,11 +188,11 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     System.out.printf("[ThirdPerson] %s%n", tpActive ? "Enabled" : "Disabled");
                     return true;
                 case "zoom-in":
-                    addZoom(-0.1f);
+                    zoomIn();
                     System.out.println("[ThirdPerson] Zoomed in");
                     return true;
                 case "zoom-out":
-                    addZoom(0.1f);
+                	zoomOut();
                     System.out.println("[ThirdPerson] Zoomed out");
                     return true;
                 case "set-zoom":
