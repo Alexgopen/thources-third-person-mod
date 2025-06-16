@@ -15,7 +15,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     private boolean tpActive = false;
     private final float dist = 4f;
 
-    private float zoomFactor = 1f;
+    private float zoomFactor = 0f;
     private static final float ZOOM_MAX = 5f;
     private static final float ZOOM_MIN = 0f;
 
@@ -136,7 +136,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     public void zoomIn()
     {
     	float factor = 0.1f;
-    	factor = (ZOOM_MAX - ZOOM_MIN)/20f;
+    	factor = (ZOOM_MAX - ZOOM_MIN)/30f;
     	setZoom(zoomFactor - factor);
     	if (tpActive && this.zoomFactor == ZOOM_MIN)
         {
@@ -147,7 +147,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     public void zoomOut()
     {
     	float factor = 0.1f;
-    	factor = (ZOOM_MAX - ZOOM_MIN)/20f;
+    	factor = (ZOOM_MAX - ZOOM_MIN)/30f;
     	if (!tpActive)
         {
         	tpActive = true;
