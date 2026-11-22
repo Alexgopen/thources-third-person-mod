@@ -18,12 +18,14 @@ When ingame, open the console with F1 and type any of the following commands:
 | `toggle`             | Turns third person on/off           |
 | `enable`<br>`on`     | Turns third person on               |
 | `disable`<br>`off`   | Turns third person off              |
-| `zoom-in`            | Zooms in by 0.1                     |
-| `zoom-out`           | Zooms out by 0.1                    |
-| `set-zoom NUMBER`    | Sets zoom to the specified value    |
+| `zoom-in`            | Zooms in by 0.4                     |
+| `zoom-out`           | Zooms out by 0.4                    |
+| `set-zoom NUMBER`    | Sets zoom from 0 to 20              |
 | `get-zoom`           | Gets the current zoom               |
 | `set-xoffset NUMBER` | Sets xOffset to the specified value |
 | `get-xoffset`        | Gets the current xOffset            |
+
+The camera can zoom to a factor of 20 while retaining free pitch and rotation. In the local camera-to-player view, mobile models and detailed trees fade when they block the player. Billboard foliage and merged structure meshes use localized cutouts where their batched render paths cannot safely fade a single instance. Terrain tiles sampled along an obstructed camera ray are cut out locally. For a cave-layer player whose camera is above the adjusted ceiling, the mod also opens a nearby surface terrain area and applies the client's cave back-face culling behavior to cave tiles crossing the view.
 
 ## Build and install from source
 

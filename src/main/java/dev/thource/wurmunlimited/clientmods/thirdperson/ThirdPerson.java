@@ -1,7 +1,12 @@
 package dev.thource.wurmunlimited.clientmods.thirdperson;
 
 import com.wurmonline.client.game.World;
+import com.wurmonline.client.renderer.Color;
+import com.wurmonline.client.renderer.ModelRenderMode;
 import com.wurmonline.client.renderer.RenderVector;
+import com.wurmonline.client.renderer.cell.Cell;
+import com.wurmonline.client.renderer.cell.SurfaceCell;
+import com.wurmonline.client.renderer.cell.TreePosition;
 import org.gotti.wurmunlimited.modloader.ReflectionUtil;
 import org.gotti.wurmunlimited.modloader.classhooks.HookManager;
 import org.gotti.wurmunlimited.modloader.interfaces.Initable;
@@ -16,8 +21,9 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     private final float dist = 4f;
 
     private float zoomFactor = 0f;
-    private static final float ZOOM_MAX = 5f;
+    private static final float ZOOM_MAX = 20f;
     private static final float ZOOM_MIN = 0f;
+    private static final float ZOOM_STEP = 0.4f;
 
     private float pitch = 45f;
     private static final float PITCH_MAX = 89.9f;
@@ -34,6 +40,145 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
 
     @Override
     public void init() {
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
+                "computeLayerVisibility", null,
+                () -> (proxy, method, args) -> {
+                    try {
+                        World world = ReflectionUtil.getPrivateField(
+                                proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
+                        CameraOcclusion.update(world, tpActive && zoomFactor > ZOOM_MIN);
+                    } catch (Throwable ignored) {
+                        // Occlusion is an optional render enhancement; keep the game render path alive.
+                    }
+                    Object result = method.invoke(proxy, args);
+                    if (args != null && args.length > 0) {
+                        CameraOcclusion.exposeSurfaceForCutaway(args[0]);
+                    }
+                    return result;
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.Cell",
+                "render", null,
+                () -> (proxy, method, args) -> {
+                    Object[] renderArgs = args;
+                    try {
+                        if (args != null && args.length > 4
+                                && Boolean.TRUE.equals(args[3]) && !Boolean.TRUE.equals(args[4])
+                                && CameraOcclusion.shouldSkipCellStructurePass((Cell) proxy)) {
+                            renderArgs = args.clone();
+                            renderArgs[3] = Boolean.FALSE;
+                        }
+                    } catch (Throwable ignored) {
+                        // A failing fade must never prevent normal cell rendering.
+                    }
+                    return method.invoke(proxy, renderArgs);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.terrain.TerrainLod",
+                "tesselate", null,
+                () -> (proxy, method, args) -> {
+                    Boolean previous = CameraOcclusion.getTerrainTessellationState();
+                    CameraOcclusion.enterTerrainTessellation();
+                    try {
+                        return method.invoke(proxy, args);
+                    } finally {
+                        CameraOcclusion.leaveTerrainTessellation(previous);
+                    }
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.game.TerrainDataBuffer",
+                "getTileType", null,
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length == 2
+                            && CameraOcclusion.isCameraTerrainHole(proxy,
+                            ((Number) args[0]).intValue(), ((Number) args[1]).intValue())) {
+                        return com.wurmonline.mesh.Tiles.Tile.TILE_HOLE;
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cave.CaveTileData",
+                "render", null,
+                () -> (proxy, method, args) -> {
+                    if (!CameraOcclusion.shouldCutCaveTile(proxy)) {
+                        return method.invoke(proxy, args);
+                    }
+                    Boolean previous = CameraOcclusion.getCaveBackfaceOverride();
+                    CameraOcclusion.enterCaveBackfaceOverride();
+                    try {
+                        return method.invoke(proxy, args);
+                    } finally {
+                        CameraOcclusion.leaveCaveBackfaceOverride(previous);
+                    }
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.comm.SimpleServerConnectionClass",
+                "canFly", null,
+                () -> (proxy, method, args) -> {
+                    if (CameraOcclusion.isCaveBackfaceOverrideActive()) {
+                        return true;
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.SurfaceCell",
+                "renderTrees", null,
+                () -> (proxy, method, args) -> {
+                    try {
+                        CameraOcclusion.prepareCellTrees((SurfaceCell) proxy);
+                    } catch (Throwable ignored) {
+                        // Fall through to Wurm's normal foliage rendering.
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.TreePosition",
+                "renderPretty", null,
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 2
+                            && args[2] == ModelRenderMode.RENDER_NORMAL
+                            && CameraOcclusion.isTreePrettyFadeActive((TreePosition) proxy)) {
+                        Object[] fadedArgs = args.clone();
+                        try {
+                            Color original = (Color) args[1];
+                            if (original == null) {
+                                original = ReflectionUtil.getPrivateField(proxy,
+                                        ReflectionUtil.getField(proxy.getClass(), "color"));
+                            }
+                            Color faded = new Color(original);
+                            faded.a = Math.min(faded.a,
+                                    CameraOcclusion.getTreeRenderAlpha((TreePosition) proxy));
+                            fadedArgs[1] = faded;
+                        } catch (Throwable ignored) {
+                            // Keep the original tree color if its per-instance data cannot be read.
+                            return method.invoke(proxy, args);
+                        }
+                        return method.invoke(proxy, fadedArgs);
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.TreePosition",
+                "prepareBillboard", null,
+                () -> (proxy, method, args) -> fadeBillboardIfBlocked(proxy, method, args));
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.TreePosition",
+                "prepareBillboardCross", null,
+                () -> (proxy, method, args) -> fadeBillboardIfBlocked(proxy, method, args));
+
+        for (String structureClass : new String[] {
+                "WallData", "FenceData", "RoofData", "FloorData", "MineDoorData",
+                "BridgeData", "BridgePartData", "HouseData"
+        }) {
+            HookManager.getInstance().registerHook("com.wurmonline.client.renderer.structures." + structureClass,
+                    "getModels", null,
+                    () -> (proxy, method, args) -> {
+                        if (CameraOcclusion.shouldOmitStructureModels(proxy)) {
+                            return 0;
+                        }
+                        return method.invoke(proxy, args);
+                    });
+        }
+
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
                 "calculateCameraOffset", null,
                 () -> (proxy, method, args) -> {
@@ -135,9 +280,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     
     public void zoomIn()
     {
-    	float factor = 0.1f;
-    	factor = (ZOOM_MAX - ZOOM_MIN)/30f;
-    	setZoom(zoomFactor - factor);
+	    setZoom(zoomFactor - ZOOM_STEP);
     	if (tpActive && this.zoomFactor == ZOOM_MIN)
         {
         	tpActive = false;
@@ -146,13 +289,30 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     
     public void zoomOut()
     {
-    	float factor = 0.1f;
-    	factor = (ZOOM_MAX - ZOOM_MIN)/30f;
     	if (!tpActive)
         {
         	tpActive = true;
         }
-    	setZoom(zoomFactor + factor);
+	setZoom(zoomFactor + ZOOM_STEP);
+    }
+
+    private Object fadeBillboardIfBlocked(Object proxy, java.lang.reflect.Method method, Object[] args)
+            throws Throwable {
+        if (args == null || args.length == 0 || !(args[0] instanceof java.nio.FloatBuffer)
+                || CameraOcclusion.getTreeRenderAlpha((TreePosition) proxy) >= 0.999f) {
+            return method.invoke(proxy, args);
+        }
+        java.nio.FloatBuffer buffer = (java.nio.FloatBuffer) args[0];
+        int first = buffer.position();
+        Object result = method.invoke(proxy, args);
+        if (result instanceof Number) {
+            int vertices = ((Number) result).intValue();
+            for (int i = 0; i < vertices; i++) {
+                buffer.put(first + i * 12 + 9,
+                        CameraOcclusion.getTreeRenderAlpha((TreePosition) proxy));
+            }
+        }
+        return result;
     }
 
     public void setXOffset(float factor) {
