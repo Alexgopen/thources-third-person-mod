@@ -79,11 +79,6 @@
 							<goal>extract-buildnumber</goal>
 						</goals>
 						<phase>prepare-package</phase>
-						<configuration>
-							<javaScriptBuildnumberCallback>
-								(tag ? tag : branch) + "-" + shortRevision
-							</javaScriptBuildnumberCallback>
-						</configuration>
 					</execution>
 				</executions>
 			</plugin>

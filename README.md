@@ -24,3 +24,15 @@ When ingame, open the console with F1 and type any of the following commands:
 | `get-zoom`           | Gets the current zoom               |
 | `set-xoffset NUMBER` | Sets xOffset to the specified value |
 | `get-xoffset`        | Gets the current xOffset            |
+
+## Build and install from source
+
+From the project root, run:
+
+```bash
+./install.sh
+```
+
+The script runs `mvn clean install`, copies the built mod jar into the Wurm Unlimited `mods/thources-third-person-mod/` directory, and runs the game's `patcher.sh`. It keeps an existing `mods/thources-third-person-mod.properties` file so its configuration remains intact. If you intentionally want to replace that file with the project template, run `./install.sh --replace-properties`; the script saves a timestamped backup first.
+
+To target a different Wurm installation, set `WURM_LAUNCHER_DIR` to its `WurmLauncher` directory.
