@@ -7,8 +7,7 @@ import com.wurmonline.client.renderer.WorldRender;
 import com.wurmonline.client.renderer.Frustum;
 import com.wurmonline.client.renderer.cell.Cell;
 import com.wurmonline.client.renderer.cell.CellRenderable;
-import com.wurmonline.client.renderer.cell.GroundItemCellRenderable;
-import com.wurmonline.client.renderer.cell.MobileModelRenderable;
+import com.wurmonline.client.renderer.cell.CreatureCellRenderable;
 import com.wurmonline.client.renderer.cell.PlayerCellRenderable;
 import com.wurmonline.client.renderer.cell.SurfaceCell;
 import com.wurmonline.client.renderer.cell.TreePosition;
@@ -134,19 +133,14 @@ final class CameraOcclusion {
         return sawStructure;
     }
 
-    static boolean shouldCutCaveTile(Object caveTileData) {
+    static boolean shouldCullCaveBackfaces() {
         Snapshot view = snapshot;
-        if (!view.active || view.playerLayer >= 0) {
-            return false;
-        }
-        try {
-            int x = ((Number) getFieldValue(caveTileData, "xTilePos")).intValue();
-            int y = ((Number) getFieldValue(caveTileData, "yTilePos")).intValue();
-            return view.caveCutawayTiles.contains(tileKey(x, y));
-        } catch (Throwable t) {
-            logOnce("caveTileRead", "Unable to read cave tile coordinates for the local camera cutaway", t);
-            return false;
-        }
+        return view.active && view.playerLayer < 0;
+    }
+
+    static boolean shouldSuppressSurfaceDecorations() {
+        Snapshot view = snapshot;
+        return view.active && view.playerLayer < 0;
     }
 
     static boolean isCaveBackfaceOverrideActive() {
@@ -282,10 +276,9 @@ final class CameraOcclusion {
         }
 
         Set<Long> terrainHoles = buildTerrainHoleTiles(world, layer, cameraH, playerX, playerY, rays);
-        Set<Long> caveTiles = buildCaveCutawayTiles(world, layer, cameraH, rays);
         return new Snapshot(world, true, layer, cameraX, cameraH, cameraY,
                 playerX, playerH, playerY, rays,
-                Collections.unmodifiableSet(terrainHoles), Collections.unmodifiableSet(caveTiles));
+                Collections.unmodifiableSet(terrainHoles));
     }
 
     private static Set<Long> buildTerrainHoleTiles(World world, int layer, float cameraH,
@@ -321,29 +314,6 @@ final class CameraOcclusion {
             for (int y = centerY - MAX_TERRAIN_HOLE_RADIUS_TILES; y <= centerY + MAX_TERRAIN_HOLE_RADIUS_TILES; y++) {
                 if (isCaveCeilingBelow(cave, x, y, cameraH)) {
                     result.add(tileKey(x, y));
-                }
-            }
-        }
-        return result;
-    }
-
-    private static Set<Long> buildCaveCutawayTiles(World world, int layer, float cameraH, List<Ray> rays) {
-        Set<Long> result = new HashSet<Long>();
-        if (layer >= 0) {
-            return result;
-        }
-        CaveDataBuffer cave = world.getCaveBuffer();
-        for (Ray ray : rays) {
-            int steps = Math.max(1, (int) Math.ceil(ray.length() / 2.0f));
-            for (int i = 0; i <= steps; i++) {
-                float t = i / (float) steps;
-                float x = ray.x0 + (ray.x1 - ray.x0) * t;
-                float h = ray.h0 + (ray.h1 - ray.h0) * t;
-                float y = ray.y0 + (ray.y1 - ray.y0) * t;
-                int tx = tileCoordinate(x);
-                int ty = tileCoordinate(y);
-                if (isCaveCeilingBelow(cave, tx, ty, h)) {
-                    result.add(tileKey(tx, ty));
                 }
             }
         }
@@ -585,8 +555,9 @@ final class CameraOcclusion {
                         continue;
                     }
                     for (Object value : (Iterable<?>) values) {
-                        if ((value instanceof MobileModelRenderable || value instanceof GroundItemCellRenderable)
+                        if (value instanceof CreatureCellRenderable
                                 && !(value instanceof PlayerCellRenderable)
+                                && !((CreatureCellRenderable) value).isItem()
                                 && isBlockingRenderable((CellRenderable) value, view)) {
                             output.put((CellRenderable) value, Boolean.TRUE);
                         }
@@ -844,12 +815,11 @@ final class CameraOcclusion {
         private final float playerY;
         private final List<Ray> rays;
         private final Set<Long> terrainHoleTiles;
-        private final Set<Long> caveCutawayTiles;
 
         private Snapshot(World world, boolean active, int playerLayer,
                          float cameraX, float cameraH, float cameraY,
                          float playerX, float playerH, float playerY,
-                         List<Ray> rays, Set<Long> terrainHoleTiles, Set<Long> caveCutawayTiles) {
+                        List<Ray> rays, Set<Long> terrainHoleTiles) {
             this.world = world;
             this.active = active;
             this.playerLayer = playerLayer;
@@ -861,12 +831,11 @@ final class CameraOcclusion {
             this.playerY = playerY;
             this.rays = Collections.unmodifiableList(new ArrayList<Ray>(rays));
             this.terrainHoleTiles = terrainHoleTiles;
-            this.caveCutawayTiles = caveCutawayTiles;
         }
 
         private static Snapshot inactive(World world) {
             return new Snapshot(world, false, 0, 0, 0, 0, 0, 0, 0,
-                    Collections.<Ray>emptyList(), Collections.<Long>emptySet(), Collections.<Long>emptySet());
+                    Collections.<Ray>emptyList(), Collections.<Long>emptySet());
         }
     }
 }

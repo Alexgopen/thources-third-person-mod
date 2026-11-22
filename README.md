@@ -25,7 +25,7 @@ When ingame, open the console with F1 and type any of the following commands:
 | `set-xoffset NUMBER` | Sets xOffset to the specified value |
 | `get-xoffset`        | Gets the current xOffset            |
 
-The camera can zoom to a factor of 20 while retaining free pitch and rotation. In the local camera-to-player view, mobile models and detailed trees fade when they block the player. Billboard foliage and merged structure meshes use localized cutouts where their batched render paths cannot safely fade a single instance. Terrain tiles sampled along an obstructed camera ray are cut out locally. For a cave-layer player whose camera is above the adjusted ceiling, the mod also opens a nearby surface terrain area and applies the client's cave back-face culling behavior to cave tiles crossing the view.
+The camera can zoom to a factor of 20 while retaining free pitch and rotation. Creatures and detailed trees fade when they block the local camera-to-player view. Ground items, projectiles, and terrain decorations are not faded. Billboard trees and merged structure meshes use localized cutouts where their batched render paths cannot safely fade a single instance. Terrain tiles sampled along an obstructed camera ray are cut out locally. During an underground third-person view, surface terrain decorations are suppressed and cave back-face culling is enabled for every cave tile, so cave ceilings and floors viewed from their outside side and cave wall backs are culled. When the camera is above the adjusted cave ceiling, the mod also opens a nearby surface terrain area.
 
 ## Build and install from source
 

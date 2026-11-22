@@ -100,7 +100,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cave.CaveTileData",
                 "render", null,
                 () -> (proxy, method, args) -> {
-                    if (!CameraOcclusion.shouldCutCaveTile(proxy)) {
+                    if (!CameraOcclusion.shouldCullCaveBackfaces()) {
                         return method.invoke(proxy, args);
                     }
                     Boolean previous = CameraOcclusion.getCaveBackfaceOverride();
@@ -110,6 +110,15 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     } finally {
                         CameraOcclusion.leaveCaveBackfaceOverride(previous);
                     }
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.terrain.decorator.DecorationRenderer",
+                "execute", null,
+                () -> (proxy, method, args) -> {
+                    if (CameraOcclusion.shouldSuppressSurfaceDecorations()) {
+                        return null;
+                    }
+                    return method.invoke(proxy, args);
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.comm.SimpleServerConnectionClass",
