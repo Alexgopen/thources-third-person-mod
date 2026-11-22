@@ -3,8 +3,16 @@ package dev.thource.wurmunlimited.clientmods.thirdperson;
 import com.wurmonline.client.game.CaveDataBuffer;
 import com.wurmonline.client.game.NearTerrainDataBuffer;
 import com.wurmonline.client.game.World;
+import com.wurmonline.client.renderer.Color;
+import com.wurmonline.client.renderer.Matrix;
+import com.wurmonline.client.renderer.ModelRenderMode;
 import com.wurmonline.client.renderer.WorldRender;
 import com.wurmonline.client.renderer.Frustum;
+import com.wurmonline.client.renderer.MaterialInstance;
+import com.wurmonline.client.renderer.backend.Primitive;
+import com.wurmonline.client.renderer.backend.Queue;
+import com.wurmonline.client.renderer.backend.RenderState;
+import com.wurmonline.client.renderer.backend.VertexBuffer;
 import com.wurmonline.client.renderer.cell.Cell;
 import com.wurmonline.client.renderer.cell.CellRenderable;
 import com.wurmonline.client.renderer.cell.CreatureCellRenderable;
@@ -12,15 +20,23 @@ import com.wurmonline.client.renderer.cell.PlayerCellRenderable;
 import com.wurmonline.client.renderer.cell.SurfaceCell;
 import com.wurmonline.client.renderer.cell.TreePosition;
 import com.wurmonline.client.renderer.cell.Volume;
+import com.wurmonline.client.renderer.structures.BridgePartData;
 import com.wurmonline.client.renderer.structures.StructureData;
+import com.wurmonline.client.renderer.light.LightManager;
+import com.wurmonline.client.renderer.shaders.StateUniformManager;
+import com.wurmonline.client.renderer.terrain.TerrainTexture;
 import com.wurmonline.client.renderer.terrain.TerrainRenderer;
 import org.gotti.wurmunlimited.modloader.ReflectionUtil;
+import com.wurmonline.mesh.Tiles;
+import com.wurmonline.client.util.GLHelper;
 
 import java.lang.reflect.Array;
 import java.lang.reflect.Field;
 import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -32,8 +48,9 @@ import java.util.logging.Logger;
 /** Client-only camera cutaways. All geometry decisions use the current render camera. */
 final class CameraOcclusion {
     private static final Logger LOGGER = Logger.getLogger(CameraOcclusion.class.getName());
-    private static final float TREE_AND_OBJECT_ALPHA = 0.28f;
-    private static final float PRETTY_TREE_FADE_MAX = 0.45f;
+    private static final float OCCLUDER_TRANSPARENCY = 0.72f;
+    private static final float PRETTY_TREE_FADE_MAX = 0.72f;
+    private static final float GHOST_STRUCTURE_ALPHA = 0.28f;
     private static final float CORRIDOR_RADIUS = 0.75f;
     private static final float PLAY_AREA_RADIUS = 3.5f;
     private static final float CAVE_CLEARANCE = 0.35f;
@@ -47,7 +64,9 @@ final class CameraOcclusion {
 
     private static volatile Snapshot snapshot = Snapshot.inactive(null);
     private static final ThreadLocal<Boolean> TERRAIN_TESSELATION = new ThreadLocal<Boolean>();
+    private static final ThreadLocal<Boolean> TERRAIN_PICKING = new ThreadLocal<Boolean>();
     private static final ThreadLocal<Boolean> CAVE_BACKFACE_OVERRIDE = new ThreadLocal<Boolean>();
+    private static final ThreadLocal<Boolean> OPAQUE_STRUCTURE_PASS = new ThreadLocal<Boolean>();
     private static final IdentityHashMap<CellRenderable, SavedTransparency> fadedRenderables =
             new IdentityHashMap<CellRenderable, SavedTransparency>();
     private static final IdentityHashMap<StructureData, Cell> blockedStructures =
@@ -73,7 +92,9 @@ final class CameraOcclusion {
 
         if (previousWorld != world) {
             restoreFadedRenderables();
-            blockedStructures.clear();
+            synchronized (blockedStructures) {
+                blockedStructures.clear();
+            }
             blockedBillboardTrees.clear();
             synchronized (treeFade) {
                 treeFade.clear();
@@ -86,6 +107,9 @@ final class CameraOcclusion {
         Snapshot old = snapshot;
         Snapshot next = createSnapshot(world, enabled);
         snapshot = next;
+
+        updateDistantCaveExitCaps(world,
+                old.world == world ? old : Snapshot.inactive(world), next);
 
         if (!old.terrainHoleTiles.equals(next.terrainHoleTiles) || old.world != next.world) {
             WorldRender renderer = world.getWorldRenderer();
@@ -133,6 +157,26 @@ final class CameraOcclusion {
         return sawStructure;
     }
 
+    static boolean shouldSkipBlockingStructureRender(Object structure) {
+        return Boolean.TRUE.equals(OPAQUE_STRUCTURE_PASS.get()) && shouldOmitStructureModels(structure);
+    }
+
+    static Boolean getOpaqueStructurePassState() {
+        return OPAQUE_STRUCTURE_PASS.get();
+    }
+
+    static void enterOpaqueStructurePass() {
+        OPAQUE_STRUCTURE_PASS.set(Boolean.TRUE);
+    }
+
+    static void leaveOpaqueStructurePass(Boolean previous) {
+        if (previous == null) {
+            OPAQUE_STRUCTURE_PASS.remove();
+        } else {
+            OPAQUE_STRUCTURE_PASS.set(previous);
+        }
+    }
+
     static boolean shouldCullCaveBackfaces() {
         Snapshot view = snapshot;
         return view.active && view.playerLayer < 0;
@@ -167,6 +211,22 @@ final class CameraOcclusion {
         return Boolean.TRUE.equals(TERRAIN_TESSELATION.get());
     }
 
+    static Boolean getTerrainPickingState() {
+        return TERRAIN_PICKING.get();
+    }
+
+    static void enterTerrainPicking() {
+        TERRAIN_PICKING.set(Boolean.TRUE);
+    }
+
+    static void leaveTerrainPicking(Boolean previous) {
+        if (previous == null) {
+            TERRAIN_PICKING.remove();
+        } else {
+            TERRAIN_PICKING.set(previous);
+        }
+    }
+
     static Boolean getTerrainTessellationState() {
         return TERRAIN_TESSELATION.get();
     }
@@ -185,16 +245,354 @@ final class CameraOcclusion {
 
     static boolean isCameraTerrainHole(Object terrainBuffer, int x, int y) {
         Snapshot view = snapshot;
-        return isTerrainTessellating() && view.active
+        return (isTerrainTessellating() || Boolean.TRUE.equals(TERRAIN_PICKING.get())) && view.active
                 && terrainBuffer instanceof NearTerrainDataBuffer
                 && view.world != null && terrainBuffer == view.world.getNearTerrainBuffer()
                 && view.terrainHoleTiles.contains(tileKey(x, y));
     }
 
-    static void exposeSurfaceForCutaway(Object frustum) {
+    static List<?> filterCavePickTriangles(List<?> triangles) {
         Snapshot view = snapshot;
-        if (view.active && !view.terrainHoleTiles.isEmpty() && frustum instanceof Frustum) {
-            ((Frustum) frustum).surfaceVisible = true;
+        if (triangles == null || triangles.isEmpty() || !view.active) {
+            return triangles;
+        }
+
+        Map<Long, Float> floorHeights = new HashMap<Long, Float>();
+        Map<Long, Float> ceilingHeights = new HashMap<Long, Float>();
+        List<Object> visible = new ArrayList<Object>(triangles.size());
+        for (Object triangle : triangles) {
+            if (isCavePickTriangleVisible(triangle, view, floorHeights, ceilingHeights)) {
+                visible.add(triangle);
+            }
+        }
+        return visible.size() == triangles.size() ? triangles : visible;
+    }
+
+    static List<?> filterCaveExitCapTriangles(List<?> triangles) {
+        Snapshot view = snapshot;
+        if (triangles == null || triangles.isEmpty() || !view.active || view.playerLayer >= 0) {
+            return triangles;
+        }
+
+        List<Object> visible = new ArrayList<Object>(triangles.size());
+        for (Object triangle : triangles) {
+            Object wallSide = getFieldValue(triangle, "wallSide");
+            Object xTile = getFieldValue(triangle, "xTile");
+            Object yTile = getFieldValue(triangle, "yTile");
+            if (!(wallSide instanceof Number) || ((Number) wallSide).intValue() != 6
+                    || !(xTile instanceof Number) || !(yTile instanceof Number)
+                    || isCaveExitCapInSurfaceRange(view,
+                    ((Number) xTile).intValue(), ((Number) yTile).intValue())) {
+                visible.add(triangle);
+            }
+        }
+        return visible.size() == triangles.size() ? triangles : visible;
+    }
+
+    private static boolean isCavePickTriangleVisible(Object triangle, Snapshot view,
+                                                     Map<Long, Float> floorHeights,
+                                                     Map<Long, Float> ceilingHeights) {
+        Object wallSideValue = getFieldValue(triangle, "wallSide");
+        Object xTileValue = getFieldValue(triangle, "xTile");
+        Object yTileValue = getFieldValue(triangle, "yTile");
+        if (!(wallSideValue instanceof Number) || !(xTileValue instanceof Number)
+                || !(yTileValue instanceof Number)) {
+            return true;
+        }
+
+        int wallSide = ((Number) wallSideValue).intValue();
+        int x = ((Number) xTileValue).intValue();
+        int y = ((Number) yTileValue).intValue();
+        if (wallSide == 0 || wallSide == 1 || wallSide == 8 || wallSide == 9
+                || wallSide == 10 || wallSide == 11) {
+            boolean ceiling = wallSide == 1;
+            Float meanHeight = getCaveTileMeanHeight(view.world.getCaveBuffer(), x, y, ceiling,
+                    ceiling ? ceilingHeights : floorHeights);
+            if (meanHeight == null) {
+                return true;
+            }
+            if ((wallSide == 1 && view.cameraH > meanHeight.floatValue())
+                    || (wallSide != 1 && view.cameraH < meanHeight.floatValue())) {
+                return false;
+            }
+        }
+
+        switch (wallSide) {
+            case 2: // West wall faces into the tile from its west edge.
+                return view.cameraX >= x * 4.0f - 0.01f;
+            case 3: // North wall faces into the tile from its north edge.
+                return view.cameraY >= y * 4.0f - 0.01f;
+            case 4: // East wall faces into the tile from its east edge.
+                return view.cameraX <= (x + 1) * 4.0f + 0.01f;
+            case 5: // South wall faces into the tile from its south edge.
+                return view.cameraY <= (y + 1) * 4.0f + 0.01f;
+            case 7: // The diagonal corner face points into the tile's southeast quadrant.
+                return view.cameraX >= x * 4.0f - 0.01f && view.cameraY >= y * 4.0f - 0.01f;
+            case 6: // Surface-textured cave exit caps are hidden with the distant surface layer.
+                return isCaveExitCapVisible(view, x, y);
+            default:
+                return true;
+        }
+    }
+
+    private static Float getCaveTileMeanHeight(CaveDataBuffer cave, int x, int y, boolean ceiling,
+                                               Map<Long, Float> cache) {
+        long key = tileKey(x, y);
+        Float value = cache.get(key);
+        if (value != null) {
+            return value;
+        }
+        try {
+            float h00 = ceiling ? cave.getAdjustedCeiling(x, y) : cave.getAdjustedFloor(x, y);
+            float h10 = ceiling ? cave.getAdjustedCeiling(x + 1, y) : cave.getAdjustedFloor(x + 1, y);
+            float h01 = ceiling ? cave.getAdjustedCeiling(x, y + 1) : cave.getAdjustedFloor(x, y + 1);
+            float h11 = ceiling ? cave.getAdjustedCeiling(x + 1, y + 1) : cave.getAdjustedFloor(x + 1, y + 1);
+            value = Float.valueOf((h00 + h10 + h01 + h11) * 0.25f);
+            cache.put(key, value);
+            return value;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    private static boolean isCaveExitCapVisible(Snapshot view, int x, int y) {
+        if (!isCaveExitCapInSurfaceRange(view, x, y)) {
+            return false;
+        }
+        if (view.world == null) {
+            return true;
+        }
+        try {
+            NearTerrainDataBuffer terrain = view.world.getNearTerrainBuffer();
+            float surfaceHeight = (terrain.getHeight(x, y) + terrain.getHeight(x + 1, y)
+                    + terrain.getHeight(x, y + 1) + terrain.getHeight(x + 1, y + 1)) * 0.25f;
+            return view.cameraH >= surfaceHeight - 0.01f;
+        } catch (Throwable ignored) {
+            return true;
+        }
+    }
+
+    private static boolean isCaveExitCapInSurfaceRange(Snapshot view, int x, int y) {
+        if (!view.active || view.playerLayer >= 0) {
+            return true;
+        }
+        int playerTileX = tileCoordinate(view.playerX);
+        int playerTileY = tileCoordinate(view.playerY);
+        return Math.max(Math.abs(x - playerTileX), Math.abs(y - playerTileY)) <= 1;
+    }
+
+    private static void updateDistantCaveExitCaps(World world, Snapshot old, Snapshot next) {
+        if (old.active == next.active && old.playerLayer == next.playerLayer
+                && tileCoordinate(old.playerX) == tileCoordinate(next.playerX)
+                && tileCoordinate(old.playerY) == tileCoordinate(next.playerY)) {
+            return;
+        }
+        try {
+            WorldRender worldRenderer = world.getWorldRenderer();
+            Object caveRenderer = getFieldValue(worldRenderer, "caveRenderer");
+            Object caveTiles = getFieldValue(caveRenderer, "caveTiles");
+            if (caveTiles == null) {
+                return;
+            }
+            for (int i = 0; i < Array.getLength(caveTiles); i++) {
+                Object tile = Array.get(caveTiles, i);
+                if (!Boolean.TRUE.equals(getFieldValue(tile, "isCaveExit"))) {
+                    continue;
+                }
+                Object xValue = getFieldValue(tile, "xTilePos");
+                Object yValue = getFieldValue(tile, "yTilePos");
+                if (!(xValue instanceof Number) || !(yValue instanceof Number)) {
+                    continue;
+                }
+                int x = ((Number) xValue).intValue();
+                int y = ((Number) yValue).intValue();
+                if (isCaveExitCapInSurfaceRange(old, x, y)
+                        != isCaveExitCapInSurfaceRange(next, x, y)) {
+                    setFieldValue(tile, "dirty", Boolean.TRUE);
+                }
+            }
+        } catch (Throwable t) {
+            logOnce("caveExitCapRefresh", "Unable to refresh distant cave exit caps", t);
+        }
+    }
+
+    static void applySurfaceVisibilityPolicy(Object frustum) {
+        Snapshot view = snapshot;
+        if (!view.active || view.playerLayer >= 0 || !(frustum instanceof Frustum)) {
+            return;
+        }
+        ((Frustum) frustum).surfaceVisible = view.surfaceOpeningNearby;
+    }
+
+    static void renderGhostStructures(Cell cell, Queue queue, Frustum frustum) {
+        Snapshot view = snapshot;
+        if (cell == null || queue == null || frustum == null || !view.active || cell.isOccluded(frustum)) {
+            return;
+        }
+        Object volume = getFieldValue(cell, "volume");
+        if (volume instanceof Volume && !((Volume) volume).isVisible(frustum)) {
+            return;
+        }
+
+        List<StructureData> targets = new ArrayList<StructureData>();
+        synchronized (blockedStructures) {
+            for (Map.Entry<StructureData, Cell> entry : blockedStructures.entrySet()) {
+                if (entry.getValue() == cell) {
+                    targets.add(entry.getKey());
+                }
+            }
+        }
+        if (targets.isEmpty()) {
+            return;
+        }
+
+        RenderState state = new RenderState();
+        state.blendmode = Primitive.BlendMode.ALPHABLEND;
+        state.alphatest = Primitive.TestFunc.ALWAYS;
+        state.alphaval = 0.0f;
+        state.depthtest = Primitive.TestFunc.LESSEQUAL;
+        state.depthwrite = false;
+        state.twosided = false;
+        Color color = new Color(1.0f, 1.0f, 1.0f, GHOST_STRUCTURE_ALPHA);
+        Object close = getFieldValue(cell, "isClose");
+        boolean isClose = Boolean.TRUE.equals(close);
+        for (StructureData structure : targets) {
+            try {
+                if (structure.isVisible(frustum)) {
+                    structure.setClose(isClose);
+                    structure.renderPicked(queue, state, color);
+                    renderGhostBridgePaving(structure, queue);
+                }
+            } catch (Throwable t) {
+                logOnce("ghostStructure_" + structure.getClass().getName(),
+                        "Unable to render a blocking structure ghost", t);
+            }
+        }
+    }
+
+    private static void renderGhostBridgePaving(StructureData structure, Queue queue) {
+        if (!(structure instanceof BridgePartData)) {
+            return;
+        }
+        try {
+            Object roadTypeValue = getFieldValue(structure, "roadType");
+            Object vertexValue = getFieldValue(structure, "pavingVbo");
+            Object matrixValue = getFieldValue(structure, "pavingMatrix");
+            if (!(roadTypeValue instanceof Number) || ((Number) roadTypeValue).byteValue() == 0
+                    || !(vertexValue instanceof VertexBuffer) || !(matrixValue instanceof Matrix)) {
+                return;
+            }
+
+            Tiles.Tile roadTile = Tiles.getTile(((Number) roadTypeValue).byteValue() & 0xff);
+            Primitive primitive = queue.reservePrimitive();
+            primitive.setDefaultState();
+            primitive.vertex = (VertexBuffer) vertexValue;
+            primitive.index = null;
+            primitive.texture[0] = TerrainTexture.getTileTexture(snapshot.world, roadTile);
+            primitive.type = Primitive.Type.QUADS;
+            primitive.num = 1;
+            primitive.depthOffset = -5.0f;
+            primitive.lightManager = queue.isDeferred() ? null : queue.getPrimaryLightManager();
+            primitive.depthtest = Primitive.TestFunc.LESSEQUAL;
+            primitive.alphatest = Primitive.TestFunc.ALWAYS;
+            primitive.blendmode = Primitive.BlendMode.ALPHABLEND;
+            primitive.depthwrite = false;
+            primitive.r = 1.0f;
+            primitive.g = 1.0f;
+            primitive.b = 1.0f;
+            primitive.a = GHOST_STRUCTURE_ALPHA;
+
+            MaterialInstance material = (MaterialInstance) getFieldValue(structure,
+                    queue.isDeferred() ? "pavingMaterialDeferred" : "pavingMaterial");
+            if (material != null) {
+                primitive.texture[1] = StateUniformManager.get().getShadowMap();
+                primitive.program = material.getProgram();
+                primitive.bindings = material.getProgramBindings(primitive.program);
+                primitive.materialInstance = material;
+                if (GLHelper.useNormalMaps()) {
+                    primitive.texture[3] = TerrainTexture.getTileNormalMap(roadTile);
+                }
+            } else {
+                primitive.texture[1] = null;
+                primitive.program = null;
+                primitive.bindings = null;
+                primitive.materialInstance = null;
+            }
+            if (primitive.lightManager != null) {
+                primitive.numSecondaryLights = LightManager.getMaxSecondaryLights(
+                        primitive.lightManager, 0, primitive.program);
+            }
+            queue.queue(primitive, (Matrix) matrixValue);
+        } catch (Throwable t) {
+            logOnce("ghostBridgePaving", "Unable to render a blocking bridge paving ghost", t);
+        }
+    }
+
+    static void renderPlayerOutline(Object worldRenderer, Object queueObject) {
+        Snapshot view = snapshot;
+        if (!view.active || !(queueObject instanceof Queue) || worldRenderer == null) {
+            return;
+        }
+        try {
+            World world = (World) getFieldValue(worldRenderer, "world");
+            if (world == null || world.getPlayer() == null || world.getPlayer().isDead()) {
+                return;
+            }
+            Object body = world.getPlayer().getPlayerBody();
+            if (body == null || getFieldValue(body, "playerModel") == null) {
+                return;
+            }
+            Field bodyStateField = ReflectionUtil.getField(body.getClass(), "renderState");
+            RenderState oldState = ReflectionUtil.getPrivateField(body, bodyStateField);
+            Object fillCustom = getFieldValue(worldRenderer, "customPickFill");
+            Object outlineCustom = getFieldValue(worldRenderer, "customPickOutline");
+            Object fillDepthCustom = getFieldValue(worldRenderer, "customPickFillDepth");
+            if (!(fillCustom instanceof Primitive.CustomPrimitive)
+                    || !(outlineCustom instanceof Primitive.CustomPrimitive)
+                    || !(fillDepthCustom instanceof Primitive.CustomPrimitive)) {
+                return;
+            }
+
+            Method renderPlayerModel = ReflectionUtil.getMethod(worldRenderer.getClass(), "renderPlayerModel",
+                    new Class<?>[] { Queue.class, float.class, Color.class, ModelRenderMode.class });
+            float playerHeight = ((Number) getFieldValue(worldRenderer, "hPlayerBase")).floatValue();
+            Queue queue = (Queue) queueObject;
+            Color white = new Color(1.0f, 1.0f, 1.0f, 1.0f);
+            try {
+                RenderState fill = new RenderState();
+                fill.depthtest = Primitive.TestFunc.ALWAYS;
+                fill.depthwrite = true;
+                fill.nolight = true;
+                fill.customstate = (Primitive.CustomPrimitive) fillCustom;
+                ReflectionUtil.setPrivateField(body, bodyStateField, fill);
+                ReflectionUtil.callPrivateMethod(worldRenderer, renderPlayerModel, queue, playerHeight,
+                        white, ModelRenderMode.RENDER_SOLID);
+
+                RenderState outline = new RenderState();
+                outline.blendmode = Primitive.BlendMode.ALPHABLEND;
+                outline.depthtest = Primitive.TestFunc.LESS;
+                outline.depthwrite = false;
+                outline.twosided = false;
+                outline.nolight = true;
+                outline.alphaval = 1.0f;
+                outline.customstate = (Primitive.CustomPrimitive) outlineCustom;
+                ReflectionUtil.setPrivateField(body, bodyStateField, outline);
+                ReflectionUtil.callPrivateMethod(worldRenderer, renderPlayerModel, queue, playerHeight,
+                        white, ModelRenderMode.RENDER_SOLID);
+
+                RenderState fillDepth = new RenderState();
+                fillDepth.depthtest = Primitive.TestFunc.ALWAYS;
+                fillDepth.depthwrite = true;
+                fillDepth.nolight = true;
+                fillDepth.customstate = (Primitive.CustomPrimitive) fillDepthCustom;
+                ReflectionUtil.setPrivateField(body, bodyStateField, fillDepth);
+                ReflectionUtil.callPrivateMethod(worldRenderer, renderPlayerModel, queue, playerHeight,
+                        white, ModelRenderMode.RENDER_SOLID);
+            } finally {
+                ReflectionUtil.setPrivateField(body, bodyStateField, oldState);
+            }
+        } catch (Throwable t) {
+            logOnce("playerOutline", "Unable to render the third-person player outline", t);
         }
     }
 
@@ -264,6 +662,8 @@ final class CameraOcclusion {
             return Snapshot.inactive(world);
         }
 
+        boolean surfaceOpeningNearby = layer < 0 && isNearSurfaceOpening(world, playerX, playerY);
+
         List<Ray> rays = new ArrayList<Ray>(11);
         addRay(rays, cameraX, cameraH, cameraY, playerX, playerH + 0.35f, playerY);
         addRay(rays, cameraX, cameraH, cameraY, playerX, playerH + 1.0f, playerY);
@@ -278,12 +678,15 @@ final class CameraOcclusion {
         Set<Long> terrainHoles = buildTerrainHoleTiles(world, layer, cameraH, playerX, playerY, rays);
         return new Snapshot(world, true, layer, cameraX, cameraH, cameraY,
                 playerX, playerH, playerY, rays,
-                Collections.unmodifiableSet(terrainHoles));
+                Collections.unmodifiableSet(terrainHoles), surfaceOpeningNearby);
     }
 
     private static Set<Long> buildTerrainHoleTiles(World world, int layer, float cameraH,
                                                    float playerX, float playerY, List<Ray> rays) {
         Set<Long> result = new HashSet<Long>();
+        if (layer >= 0) {
+            return result;
+        }
         NearTerrainDataBuffer terrain = world.getNearTerrainBuffer();
         for (Ray ray : rays) {
             int steps = Math.max(1, (int) Math.ceil(ray.length() / 2.0f));
@@ -303,10 +706,6 @@ final class CameraOcclusion {
             }
         }
 
-        if (layer >= 0) {
-            return result;
-        }
-
         CaveDataBuffer cave = world.getCaveBuffer();
         int centerX = tileCoordinate(playerX);
         int centerY = tileCoordinate(playerY);
@@ -318,6 +717,35 @@ final class CameraOcclusion {
             }
         }
         return result;
+    }
+
+    private static boolean isNearSurfaceOpening(World world, float playerX, float playerY) {
+        NearTerrainDataBuffer terrain = world.getNearTerrainBuffer();
+        CaveDataBuffer cave = world.getCaveBuffer();
+        int centerX = tileCoordinate(playerX);
+        int centerY = tileCoordinate(playerY);
+        for (int x = centerX - 1; x <= centerX + 1; x++) {
+            for (int y = centerY - 1; y <= centerY + 1; y++) {
+                try {
+                    if (cave.isValid(x * 4.0f, y * 4.0f)
+                            && cave.getTileType(x, y) == Tiles.Tile.TILE_CAVE_EXIT) {
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                    // Continue checking the surface buffer for a corresponding entrance tile.
+                }
+                try {
+                    Tiles.Tile surface = terrain.getTileType(x, y);
+                    if (surface == Tiles.Tile.TILE_HOLE || Tiles.isMineDoor(surface)
+                            || surface.isVisibleCaveDoor() || surface.isCaveDoor()) {
+                        return true;
+                    }
+                } catch (Throwable ignored) {
+                    // Skip tiles outside the loaded near-terrain buffer.
+                }
+            }
+        }
+        return false;
     }
 
     private static boolean isCaveCeilingBelow(CaveDataBuffer cave, int x, int y, float height) {
@@ -341,18 +769,22 @@ final class CameraOcclusion {
             collectStructures(caves, view, next);
         }
 
-        for (Map.Entry<StructureData, Cell> entry : blockedStructures.entrySet()) {
+        IdentityHashMap<StructureData, Cell> previous;
+        synchronized (blockedStructures) {
+            previous = new IdentityHashMap<StructureData, Cell>(blockedStructures);
+            blockedStructures.clear();
+            blockedStructures.putAll(next);
+        }
+        for (Map.Entry<StructureData, Cell> entry : previous.entrySet()) {
             if (!next.containsKey(entry.getKey())) {
                 markStructureCellDirty(entry.getValue());
             }
         }
         for (Map.Entry<StructureData, Cell> entry : next.entrySet()) {
-            if (!blockedStructures.containsKey(entry.getKey())) {
+            if (!previous.containsKey(entry.getKey())) {
                 markStructureCellDirty(entry.getValue());
             }
         }
-        blockedStructures.clear();
-        blockedStructures.putAll(next);
     }
 
     private static void collectStructures(Object cells, Snapshot view,
@@ -518,7 +950,7 @@ final class CameraOcclusion {
 
                 boolean blocked = targets.containsKey(renderable);
                 if (blocked) {
-                    saved.currentAlpha = Math.min(TREE_AND_OBJECT_ALPHA, saved.currentAlpha + step);
+                    saved.currentAlpha = Math.min(OCCLUDER_TRANSPARENCY, saved.currentAlpha + step);
                 } else {
                     saved.currentAlpha = Math.max(0.0f, saved.currentAlpha - step);
                 }
@@ -702,7 +1134,9 @@ final class CameraOcclusion {
 
     private static void clearWorldState() {
         restoreFadedRenderables();
-        blockedStructures.clear();
+        synchronized (blockedStructures) {
+            blockedStructures.clear();
+        }
         blockedBillboardTrees.clear();
         synchronized (treeFade) {
             treeFade.clear();
@@ -815,11 +1249,12 @@ final class CameraOcclusion {
         private final float playerY;
         private final List<Ray> rays;
         private final Set<Long> terrainHoleTiles;
+        private final boolean surfaceOpeningNearby;
 
         private Snapshot(World world, boolean active, int playerLayer,
                          float cameraX, float cameraH, float cameraY,
                          float playerX, float playerH, float playerY,
-                        List<Ray> rays, Set<Long> terrainHoleTiles) {
+                         List<Ray> rays, Set<Long> terrainHoleTiles, boolean surfaceOpeningNearby) {
             this.world = world;
             this.active = active;
             this.playerLayer = playerLayer;
@@ -831,11 +1266,12 @@ final class CameraOcclusion {
             this.playerY = playerY;
             this.rays = Collections.unmodifiableList(new ArrayList<Ray>(rays));
             this.terrainHoleTiles = terrainHoleTiles;
+            this.surfaceOpeningNearby = surfaceOpeningNearby;
         }
 
         private static Snapshot inactive(World world) {
             return new Snapshot(world, false, 0, 0, 0, 0, 0, 0, 0,
-                    Collections.<Ray>emptyList(), Collections.<Long>emptySet());
+                    Collections.<Ray>emptyList(), Collections.<Long>emptySet(), false);
         }
     }
 }

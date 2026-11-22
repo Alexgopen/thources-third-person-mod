@@ -52,7 +52,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     }
                     Object result = method.invoke(proxy, args);
                     if (args != null && args.length > 0) {
-                        CameraOcclusion.exposeSurfaceForCutaway(args[0]);
+                        CameraOcclusion.applySurfaceVisibilityPolicy(args[0]);
                     }
                     return result;
                 });
@@ -71,7 +71,31 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     } catch (Throwable ignored) {
                         // A failing fade must never prevent normal cell rendering.
                     }
-                    return method.invoke(proxy, renderArgs);
+                    boolean opaqueStructurePass = renderArgs != null && renderArgs.length > 4
+                            && Boolean.TRUE.equals(renderArgs[3]) && !Boolean.TRUE.equals(renderArgs[4]);
+                    Boolean previousStructurePass = CameraOcclusion.getOpaqueStructurePassState();
+                    if (opaqueStructurePass) {
+                        CameraOcclusion.enterOpaqueStructurePass();
+                    }
+                    try {
+                        Object result = method.invoke(proxy, renderArgs);
+                        boolean transparentObjectPass = args != null && args.length > 4
+                                && Boolean.TRUE.equals(args[2]) && Boolean.TRUE.equals(args[4]);
+                        if (transparentObjectPass) {
+                            try {
+                                CameraOcclusion.renderGhostStructures((Cell) proxy,
+                                        (com.wurmonline.client.renderer.backend.Queue) args[0],
+                                        (com.wurmonline.client.renderer.Frustum) args[1]);
+                            } catch (Throwable ignored) {
+                                // Keep the ordinary transparent-object pass alive if a ghost draw fails.
+                            }
+                        }
+                        return result;
+                    } finally {
+                        if (opaqueStructurePass) {
+                            CameraOcclusion.leaveOpaqueStructurePass(previousStructurePass);
+                        }
+                    }
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.terrain.TerrainLod",
@@ -84,6 +108,60 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     } finally {
                         CameraOcclusion.leaveTerrainTessellation(previous);
                     }
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.PickRenderer",
+                "execute", null,
+                () -> (proxy, method, args) -> {
+                    Boolean previous = CameraOcclusion.getTerrainPickingState();
+                    CameraOcclusion.enterTerrainPicking();
+                    try {
+                        return method.invoke(proxy, args);
+                    } finally {
+                        CameraOcclusion.leaveTerrainPicking(previous);
+                    }
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.TilePicker",
+                "pick", "(Lcom/wurmonline/client/renderer/backend/Queue;Lcom/wurmonline/client/game/World;IIILjava/nio/FloatBuffer;)I",
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 4 && args[1] instanceof World
+                            && CameraOcclusion.isCameraTerrainHole(
+                            ((World) args[1]).getNearTerrainBuffer(),
+                            ((Number) args[2]).intValue(), ((Number) args[3]).intValue())) {
+                        return 0;
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cave.CaveTileData",
+                "buffer", "(Ljava/util/List;Lcom/wurmonline/client/renderer/Matrix;)V",
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 0 && args[0] instanceof java.util.List<?>) {
+                        java.util.List<?> visible = CameraOcclusion.filterCaveExitCapTriangles(
+                                (java.util.List<?>) args[0]);
+                        if (visible != args[0]) {
+                            Object[] filteredArgs = args.clone();
+                            filteredArgs[0] = visible;
+                            return method.invoke(proxy, filteredArgs);
+                        }
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cave.CaveTileData",
+                "subPick", "(Ljava/util/List;Ljava/nio/FloatBuffer;)V",
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 0 && args[0] instanceof java.util.List<?>) {
+                        java.util.List<?> visible = CameraOcclusion.filterCavePickTriangles(
+                                (java.util.List<?>) args[0]);
+                        if (visible != args[0]) {
+                            Object[] filteredArgs = args.clone();
+                            filteredArgs[0] = visible;
+                            return method.invoke(proxy, filteredArgs);
+                        }
+                    }
+                    return method.invoke(proxy, args);
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.game.TerrainDataBuffer",
@@ -186,7 +264,35 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                         }
                         return method.invoke(proxy, args);
                     });
+
+            HookManager.getInstance().registerHook("com.wurmonline.client.renderer.structures." + structureClass,
+                    "render", null,
+                    () -> (proxy, method, args) -> {
+                        if (CameraOcclusion.shouldSkipBlockingStructureRender(proxy)) {
+                            return null;
+                        }
+                        return method.invoke(proxy, args);
+                    });
         }
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
+                "renderPickedItem", null,
+                () -> (proxy, method, args) -> {
+                    Object result = method.invoke(proxy, args);
+                    if (args != null && args.length > 0) {
+                        CameraOcclusion.renderPlayerOutline(proxy, args[0]);
+                    }
+                    return result;
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.structures.BridgePartData",
+                "renderPaving", null,
+                () -> (proxy, method, args) -> {
+                    if (CameraOcclusion.shouldSkipBlockingStructureRender(proxy)) {
+                        return null;
+                    }
+                    return method.invoke(proxy, args);
+                });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
                 "calculateCameraOffset", null,
