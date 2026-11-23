@@ -7,6 +7,7 @@ import com.wurmonline.client.renderer.RenderVector;
 import com.wurmonline.client.renderer.cell.Cell;
 import com.wurmonline.client.renderer.cell.SurfaceCell;
 import com.wurmonline.client.renderer.cell.TreePosition;
+import com.wurmonline.shared.constants.PlayerAction;
 import org.gotti.wurmunlimited.modloader.ReflectionUtil;
 import org.gotti.wurmunlimited.modloader.classhooks.HookManager;
 import org.gotti.wurmunlimited.modloader.interfaces.Initable;
@@ -15,12 +16,30 @@ import org.gotti.wurmunlimited.modloader.interfaces.WurmClientMod;
 import org.gotti.wurmunlimited.modsupport.console.ConsoleListener;
 import org.gotti.wurmunlimited.modsupport.console.ModConsole;
 
+import java.lang.reflect.Method;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+
 
 public class ThirdPerson implements WurmClientMod, Initable, PreInitable, ConsoleListener {
-    private boolean tpActive = false;
+    private static final Logger LOGGER = Logger.getLogger(ThirdPerson.class.getName());
+    private static volatile ThirdPerson instance;
+    private static volatile CameraMenuButtonSupport cameraMenuButtonSupport;
+    private static volatile boolean cameraMenuFailureLogged;
+    private static final PlayerAction[] CAMERA_MENU_ACTIONS = {
+            new PlayerAction("", (short) 32000, 65535, "Top view"),
+            new PlayerAction("", (short) 32001, 65535, "Face North"),
+            new PlayerAction("", (short) 32002, 65535, "Face East"),
+            new PlayerAction("", (short) 32003, 65535, "Face West"),
+            new PlayerAction("", (short) 32004, 65535, "Face South"),
+            new PlayerAction("", (short) 32005, 65535, "Rotate Right"),
+            new PlayerAction("", (short) 32006, 65535, "Rotate Left")
+    };
+
+    private volatile boolean tpActive = false;
     private final float dist = 4f;
 
-    private float zoomFactor = 0f;
+    private volatile float zoomFactor = 0f;
     private static final float ZOOM_MAX = 20f;
     private static final float ZOOM_MIN = 0f;
     private static final float ZOOM_STEP = 0.4f;
@@ -33,6 +52,12 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
     private static final float X_OFFSET_MAX = 5f;
     private static final float X_OFFSET_MIN = -X_OFFSET_MAX;
 
+    private volatile World currentWorld;
+    private volatile boolean cameraYawOverrideActive;
+    private volatile boolean cameraPitchOverrideActive;
+    private volatile float cameraYawOverride;
+    private volatile float cameraPitchOverride;
+
     @Override
     public void preInit() {
 
@@ -40,12 +65,14 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
 
     @Override
     public void init() {
+        instance = this;
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
                 "computeLayerVisibility", null,
                 () -> (proxy, method, args) -> {
                     try {
                         World world = ReflectionUtil.getPrivateField(
                                 proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
+                        currentWorld = world;
                         CameraOcclusion.update(world, tpActive && zoomFactor > ZOOM_MIN);
                     } catch (Throwable ignored) {
                         // Occlusion is an optional render enhancement; keep the game render path alive.
@@ -55,6 +82,33 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                         CameraOcclusion.applySurfaceVisibilityPolicy(args[0]);
                     }
                     return result;
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.gui.HeadsUpDisplay",
+                "showPopupComponent", null,
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 0) {
+                        try {
+                            appendCameraOptionsToCompassPopup(args[0]);
+                        } catch (Throwable t) {
+                            logCompassMenuFailure(t);
+                        }
+                    }
+                    return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.gui.HeadsUpDisplay",
+                "sendPopupAction", "(Lcom/wurmonline/shared/constants/PlayerAction;)V",
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 0 && args[0] instanceof PlayerAction) {
+                        int cameraAction = findCameraMenuAction((PlayerAction) args[0]);
+                        ThirdPerson mod = instance;
+                        if (cameraAction >= 0 && mod != null) {
+                            mod.applyCameraMenuAction(cameraAction);
+                            return null;
+                        }
+                    }
+                    return method.invoke(proxy, args);
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.Cell",
@@ -155,13 +209,21 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     if (args != null && args.length > 0 && args[0] instanceof java.util.List<?>) {
                         java.util.List<?> visible = CameraOcclusion.filterCavePickTriangles(
                                 (java.util.List<?>) args[0]);
+                        Object[] pickArgs = args;
                         if (visible != args[0]) {
-                            Object[] filteredArgs = args.clone();
-                            filteredArgs[0] = visible;
-                            return method.invoke(proxy, filteredArgs);
+                            pickArgs = args.clone();
+                            pickArgs[0] = visible;
                         }
+                        return method.invoke(proxy, pickArgs);
                     }
                     return method.invoke(proxy, args);
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cave.CaveRender",
+                "getPickedWall", null,
+                () -> (proxy, method, args) -> {
+                    Object picker = method.invoke(proxy, args);
+                    return CameraOcclusion.highlightNearestWallForHiddenCeiling(proxy, picker);
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.game.TerrainDataBuffer",
@@ -211,12 +273,18 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.SurfaceCell",
                 "renderTrees", null,
                 () -> (proxy, method, args) -> {
+                    Object billboardFadeState = null;
                     try {
                         CameraOcclusion.prepareCellTrees((SurfaceCell) proxy);
+                        billboardFadeState = CameraOcclusion.beginBillboardTreeFade((SurfaceCell) proxy);
                     } catch (Throwable ignored) {
                         // Fall through to Wurm's normal foliage rendering.
                     }
-                    return method.invoke(proxy, args);
+                    try {
+                        return method.invoke(proxy, args);
+                    } finally {
+                        CameraOcclusion.restoreTreeFadeState(billboardFadeState);
+                    }
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.cell.TreePosition",
@@ -240,7 +308,15 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                             // Keep the original tree color if its per-instance data cannot be read.
                             return method.invoke(proxy, args);
                         }
-                        return method.invoke(proxy, fadedArgs);
+                        Object fadeState = CameraOcclusion.beginPrettyTreeFade((TreePosition) proxy);
+                        if (fadeState == null) {
+                            return method.invoke(proxy, args);
+                        }
+                        try {
+                            return method.invoke(proxy, fadedArgs);
+                        } finally {
+                            CameraOcclusion.restoreTreeFadeState(fadeState);
+                        }
                     }
                     return method.invoke(proxy, args);
                 });
@@ -304,12 +380,44 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                         World world = ReflectionUtil.getPrivateField(
                                 proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
 
+                        float cameraYaw = effectiveCameraYaw(world);
+                        if (cameraYawOverrideActive) {
+                            cameraOffset.rotateY(Math.toRadians(world.getPlayerRotX() - cameraYaw));
+                        }
+
                         RenderVector target = new RenderVector(xOffset, 0, 0);
-                        target.rotateY(Math.toRadians(world.getPlayerRotX()));
+                        target.rotateY(Math.toRadians(cameraYaw));
                         cameraOffset.add(target);
                     }
                     //noinspection SuspiciousInvocationHandlerImplementation
                     return null;
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
+                "calculateCamera", null,
+                () -> (proxy, method, args) -> {
+                    Object result = method.invoke(proxy, args);
+                    if (tpActive && (cameraYawOverrideActive || cameraPitchOverrideActive)) {
+                        World world = ReflectionUtil.getPrivateField(
+                                proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
+                        ReflectionUtil.setPrivateField(proxy,
+                                ReflectionUtil.getField(proxy.getClass(), "cameraRotX"),
+                                (float) Math.toRadians(effectiveCameraYaw(world)));
+                        ReflectionUtil.setPrivateField(proxy,
+                                ReflectionUtil.getField(proxy.getClass(), "cameraRotY"),
+                                (float) Math.toRadians(effectiveCameraPitch(world)));
+                    }
+                    return result;
+                });
+
+        HookManager.getInstance().registerHook("com.wurmonline.client.game.PlayerObj",
+                "turn", "(IIZ)V",
+                () -> (proxy, method, args) -> {
+                    if (args != null && args.length > 1
+                            && (((Number) args[0]).intValue() != 0 || ((Number) args[1]).intValue() != 0)) {
+                        clearCameraViewOverride();
+                    }
+                    return method.invoke(proxy, args);
                 });
 
         HookManager.getInstance().registerHook("com.wurmonline.client.renderer.WorldRender",
@@ -324,12 +432,12 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                             proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
 
                     RenderVector target = new RenderVector(xOffset, 0, 0);
-                    target.rotateY(Math.toRadians(world.getPlayerRotX()));
+                    target.rotateY(Math.toRadians(effectiveCameraYaw(world)));
 
                     float x = cameraOffset.getX() - target.getX();
                     float z = cameraOffset.getZ() - target.getZ();
                     double yaw = Math.atan2(z, x);
-                    setPitch(world.getPlayerRotY());
+                    setPitch(effectiveCameraPitch(world));
                     
                     double cameraX = (float) method.invoke(proxy, args) + Math.cos(Math.toRadians(pitch)) * Math.cos(yaw) * zoomFactor * -dist;
                     
@@ -345,7 +453,7 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                     World world = ReflectionUtil.getPrivateField(
                             proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
 
-                    setPitch(world.getPlayerRotY());
+                    setPitch(effectiveCameraPitch(world));
 
                     double cameraY = world.getPlayerPosH() + 1.5f + Math.sin(Math.toRadians(pitch)) * zoomFactor * dist;
                     
@@ -364,12 +472,12 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
                             proxy, ReflectionUtil.getField(proxy.getClass(), "world"));
 
                     RenderVector target = new RenderVector(xOffset, 0, 0);
-                    target.rotateY(Math.toRadians(world.getPlayerRotX()));
+                    target.rotateY(Math.toRadians(effectiveCameraYaw(world)));
 
                     float x = cameraOffset.getX() - target.getX();
                     float z = cameraOffset.getZ() - target.getZ();
                     double yaw = Math.atan2(z, x);
-                    setPitch(world.getPlayerRotY());
+                    setPitch(effectiveCameraPitch(world));
                     
                     double cameraZ = (float) method.invoke(proxy, args) + Math.sin(yaw) * Math.cos(Math.toRadians(pitch)) * zoomFactor * -dist;
                     
@@ -383,6 +491,149 @@ public class ThirdPerson implements WurmClientMod, Initable, PreInitable, Consol
         });
 
         ModConsole.addConsoleListener(this);
+    }
+
+    private void applyCameraMenuAction(int action) {
+        World world = currentWorld;
+        if (world == null || world.getPlayer() == null) {
+            return;
+        }
+
+        tpActive = true;
+        if (zoomFactor <= ZOOM_MIN) {
+            zoomFactor = 1.0f;
+        }
+
+        switch (action) {
+            case 0: // Top view
+                if (!cameraYawOverrideActive) {
+                    cameraYawOverride = world.getPlayerRotX();
+                    cameraYawOverrideActive = true;
+                }
+                cameraPitchOverride = 90.0f;
+                cameraPitchOverrideActive = true;
+                break;
+            case 1: // Face North
+                setCameraYawOverride(0.0f);
+                break;
+            case 2: // Face East
+                setCameraYawOverride(90.0f);
+                break;
+            case 3: // Face West
+                setCameraYawOverride(270.0f);
+                break;
+            case 4: // Face South
+                setCameraYawOverride(180.0f);
+                break;
+            case 5: // Rotate Right
+                setCameraYawOverride(effectiveCameraYaw(world) + 90.0f);
+                break;
+            case 6: // Rotate Left
+                setCameraYawOverride(effectiveCameraYaw(world) - 90.0f);
+                break;
+            default:
+                break;
+        }
+        orientPlayerToCameraYaw(world);
+    }
+
+    private void orientPlayerToCameraYaw(World world) {
+        try {
+            float facing = normalizeAngle(effectiveCameraYaw(world));
+            Object player = world.getPlayer();
+            ReflectionUtil.setPrivateField(player,
+                    ReflectionUtil.getField(player.getClass(), "xRotUsed"), Float.valueOf(facing));
+            world.getPlayer().getPos().rotateX(facing);
+        } catch (Throwable t) {
+            LOGGER.log(Level.WARNING, "Unable to orient the player for the compass camera command", t);
+        }
+    }
+
+    private void setCameraYawOverride(float yaw) {
+        cameraYawOverride = normalizeAngle(yaw);
+        cameraYawOverrideActive = true;
+    }
+
+    private static float normalizeAngle(float angle) {
+        float normalized = angle % 360.0f;
+        return normalized < 0.0f ? normalized + 360.0f : normalized;
+    }
+
+    private float effectiveCameraYaw(World world) {
+        return cameraYawOverrideActive ? cameraYawOverride : world.getPlayerRotX();
+    }
+
+    private float effectiveCameraPitch(World world) {
+        return cameraPitchOverrideActive ? cameraPitchOverride : world.getPlayerRotY();
+    }
+
+    private void clearCameraViewOverride() {
+        cameraYawOverrideActive = false;
+        cameraPitchOverrideActive = false;
+    }
+
+    private static void appendCameraOptionsToCompassPopup(Object popup) throws Exception {
+        if (popup == null || !"com.wurmonline.client.renderer.gui.WurmPopup".equals(
+                popup.getClass().getName())) {
+            return;
+        }
+        Object id = ReflectionUtil.getPrivateField(popup,
+                ReflectionUtil.getField(popup.getClass(), "id"));
+        if (!"compassMenu".equals(id)) {
+            return;
+        }
+
+        CameraMenuButtonSupport support = getCameraMenuButtonSupport(popup.getClass());
+        support.addSeparator.invoke(popup);
+        for (PlayerAction action : CAMERA_MENU_ACTIONS) {
+            support.addButton.invoke(popup, action, null, Boolean.FALSE);
+        }
+    }
+
+    private static synchronized CameraMenuButtonSupport getCameraMenuButtonSupport(Class<?> popupClass)
+            throws Exception {
+        CameraMenuButtonSupport current = cameraMenuButtonSupport;
+        if (current != null && current.popupClass == popupClass) {
+            return current;
+        }
+
+        Method addButton = popupClass.getDeclaredMethod("addButton",
+                PlayerAction.class, popupClass, boolean.class);
+        Method addSeparator = popupClass.getDeclaredMethod("addSeparator");
+        addButton.setAccessible(true);
+        addSeparator.setAccessible(true);
+        current = new CameraMenuButtonSupport(popupClass, addButton, addSeparator);
+        cameraMenuButtonSupport = current;
+        return current;
+    }
+
+    private static int findCameraMenuAction(PlayerAction action) {
+        for (int i = 0; i < CAMERA_MENU_ACTIONS.length; i++) {
+            if (CAMERA_MENU_ACTIONS[i] == action) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static void logCompassMenuFailure(Throwable failure) {
+        if (!cameraMenuFailureLogged) {
+            cameraMenuFailureLogged = true;
+            LOGGER.log(Level.WARNING, "Unable to add third-person camera actions to the compass menu", failure);
+        }
+    }
+
+    private static final class CameraMenuButtonSupport {
+        private final Class<?> popupClass;
+        private final Method addButton;
+        private final Method addSeparator;
+
+        private CameraMenuButtonSupport(Class<?> popupClass,
+                                        Method addButton, Method addSeparator) {
+            this.popupClass = popupClass;
+            this.addButton = addButton;
+            this.addSeparator = addSeparator;
+        }
     }
 
     public void setZoom(float factor) {

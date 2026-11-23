@@ -49,12 +49,12 @@ import java.util.logging.Logger;
 final class CameraOcclusion {
     private static final Logger LOGGER = Logger.getLogger(CameraOcclusion.class.getName());
     private static final float OCCLUDER_TRANSPARENCY = 0.72f;
-    private static final float PRETTY_TREE_FADE_MAX = 0.72f;
-    private static final float GHOST_STRUCTURE_ALPHA = 0.28f;
+    private static final float PRETTY_TREE_FADE_MAX = 0.55f;
+    private static final float GHOST_STRUCTURE_ALPHA = 0.18f;
     private static final float CORRIDOR_RADIUS = 0.75f;
+    private static final float STRUCTURE_CORRIDOR_RADIUS = 0.25f;
     private static final float PLAY_AREA_RADIUS = 3.5f;
     private static final float CAVE_CLEARANCE = 0.35f;
-    private static final int MAX_TERRAIN_HOLE_RADIUS_TILES = 2;
     private static final String[] RENDERABLE_LISTS = {
             "staticRenderables", "staticAnimatedRenderables", "mobileRenderables"
     };
@@ -261,11 +261,137 @@ final class CameraOcclusion {
         Map<Long, Float> ceilingHeights = new HashMap<Long, Float>();
         List<Object> visible = new ArrayList<Object>(triangles.size());
         for (Object triangle : triangles) {
-            if (isCavePickTriangleVisible(triangle, view, floorHeights, ceilingHeights)) {
+            if (isCavePickTriangleVisible(triangle, view, floorHeights, ceilingHeights)
+                    || isHiddenCaveCeiling(triangle, view, ceilingHeights)) {
                 visible.add(triangle);
             }
         }
         return visible.size() == triangles.size() ? triangles : visible;
+    }
+
+    private static boolean isHiddenCaveCeiling(Object triangle, Snapshot view,
+                                               Map<Long, Float> ceilingHeights) {
+        if (!view.active || view.playerLayer >= 0 || view.world == null) {
+            return false;
+        }
+        Object wallSide = getFieldValue(triangle, "wallSide");
+        Object xTile = getFieldValue(triangle, "xTile");
+        Object yTile = getFieldValue(triangle, "yTile");
+        if (!(wallSide instanceof Number) || ((Number) wallSide).intValue() != 1
+                || !(xTile instanceof Number) || !(yTile instanceof Number)) {
+            return false;
+        }
+        return isHiddenCaveCeilingAt(view, ((Number) xTile).intValue(),
+                ((Number) yTile).intValue(), ceilingHeights);
+    }
+
+    private static boolean isHiddenCaveCeilingAt(Snapshot view, int x, int y,
+                                                 Map<Long, Float> ceilingHeights) {
+        if (!view.active || view.playerLayer >= 0 || view.world == null) {
+            return false;
+        }
+        Float ceilingHeight = getCaveTileMeanHeight(view.world.getCaveBuffer(), x, y,
+                true, ceilingHeights);
+        return ceilingHeight != null && view.cameraH > ceilingHeight.floatValue();
+    }
+
+    /**
+     * Convert a hit on a hidden ceiling into a real, existing wall picker for the same tile.
+     * Rewriting the picker after Wurm has decoded its hit names is more robust than changing
+     * ColorPicker's global name stack while cave triangles are being submitted.
+     */
+    static Object highlightNearestWallForHiddenCeiling(Object caveRender, Object picker) {
+        Snapshot view = snapshot;
+        if (caveRender == null || picker == null || !view.active || view.playerLayer >= 0) {
+            return picker;
+        }
+
+        Object wallSideValue = getFieldValue(picker, "wallSide");
+        Object xValue = getFieldValue(picker, "x");
+        Object yValue = getFieldValue(picker, "y");
+        if (!(wallSideValue instanceof Number) || ((Number) wallSideValue).intValue() != 1
+                || !(xValue instanceof Number) || !(yValue instanceof Number)) {
+            return picker;
+        }
+
+        int x = ((Number) xValue).intValue();
+        int y = ((Number) yValue).intValue();
+        if (!isHiddenCaveCeilingAt(view, x, y, new HashMap<Long, Float>())) {
+            return picker;
+        }
+
+        try {
+            Method getTile = caveRender.getClass().getDeclaredMethod("getTile", int.class, int.class);
+            getTile.setAccessible(true);
+            Object tileData = getTile.invoke(caveRender, x, y);
+            Method addTrianglesFor = tileData.getClass().getDeclaredMethod("addTrianglesFor",
+                    int.class, int.class, int.class, List.class);
+            addTrianglesFor.setAccessible(true);
+
+            List<Object> nearestWall = null;
+            int nearestSide = 0;
+            float nearestDistance = Float.POSITIVE_INFINITY;
+            for (int side = 2; side <= 5; side++) {
+                List<Object> triangles = new ArrayList<Object>();
+                addTrianglesFor.invoke(tileData, x, y, side, triangles);
+                if (triangles.isEmpty()) {
+                    continue;
+                }
+                float distance = caveWallEdgeDistanceSquared(view, x, y, side);
+                if (distance < nearestDistance) {
+                    nearestDistance = distance;
+                    nearestSide = side;
+                    nearestWall = triangles;
+                }
+            }
+            if (nearestWall == null) {
+                return picker;
+            }
+
+            int neighborX = x;
+            int neighborY = y;
+            if (nearestSide == 2) {
+                neighborX--;
+            } else if (nearestSide == 3) {
+                neighborY--;
+            } else if (nearestSide == 4) {
+                neighborX++;
+            } else {
+                neighborY++;
+            }
+            Tiles.Tile neighbor = view.world.getCaveBuffer().getTileType(neighborX, neighborY);
+            String name = neighbor == null ? "Cave wall" : neighbor.getTileName((byte) nearestSide);
+            Method init = picker.getClass().getMethod("init", int.class, int.class, int.class,
+                    int.class, int.class, String.class, List.class);
+            init.invoke(picker, x, y, nearestSide, neighborX, neighborY, name, nearestWall);
+            return picker;
+        } catch (Throwable t) {
+            logOnce("hiddenCeilingPicker", "Unable to map a hidden cave ceiling hit to its nearest wall", t);
+            return picker;
+        }
+    }
+
+    private static float caveWallEdgeDistanceSquared(Snapshot view, int x, int y, int side) {
+        float westX = x * 4.0f;
+        float eastX = (x + 1) * 4.0f;
+        float northY = y * 4.0f;
+        float southY = (y + 1) * 4.0f;
+        float playerXOnEdge = Math.max(westX, Math.min(eastX, view.playerX));
+        float playerYOnEdge = Math.max(northY, Math.min(southY, view.playerY));
+        switch (side) {
+            case 2:
+                return squaredDistance(view.playerX - westX, view.playerY - playerYOnEdge);
+            case 3:
+                return squaredDistance(view.playerX - playerXOnEdge, view.playerY - northY);
+            case 4:
+                return squaredDistance(view.playerX - eastX, view.playerY - playerYOnEdge);
+            default:
+                return squaredDistance(view.playerX - playerXOnEdge, view.playerY - southY);
+        }
+    }
+
+    private static float squaredDistance(float x, float y) {
+        return x * x + y * y;
     }
 
     static List<?> filterCaveExitCapTriangles(List<?> triangles) {
@@ -634,6 +760,70 @@ final class CameraOcclusion {
         return getTreeRenderAlpha(tree) < 0.999f;
     }
 
+    static Object beginPrettyTreeFade(TreePosition tree) {
+        try {
+            Field stateField = ReflectionUtil.getField(tree.getClass(), "renderState");
+            RenderState state = ReflectionUtil.getPrivateField(tree, stateField);
+            return beginTreeFadeState(state);
+        } catch (Throwable t) {
+            logOnce("prettyTreeFadeState", "Unable to enable alpha blending for a ghosted tree", t);
+            return null;
+        }
+    }
+
+    static Object beginBillboardTreeFade(SurfaceCell cell) {
+        if (cell == null || Boolean.TRUE.equals(getFieldValue(cell, "usePrettyTrees"))
+                || !hasFadedTree(cell)) {
+            return null;
+        }
+        try {
+            Field stateField = ReflectionUtil.getField(cell.getClass(), "billboardState");
+            RenderState state = ReflectionUtil.getPrivateField(cell, stateField);
+            return beginTreeFadeState(state);
+        } catch (Throwable t) {
+            logOnce("billboardTreeFadeState", "Unable to enable alpha blending for ghosted billboard trees", t);
+            return null;
+        }
+    }
+
+    static void restoreTreeFadeState(Object savedState) {
+        if (!(savedState instanceof TreeFadeRenderState)) {
+            return;
+        }
+        TreeFadeRenderState saved = (TreeFadeRenderState) savedState;
+        saved.state.alphatest = saved.alphaTest;
+        saved.state.alphaval = saved.alphaValue;
+        saved.state.blendmode = saved.blendMode;
+        saved.state.depthwrite = saved.depthWrite;
+    }
+
+    private static Object beginTreeFadeState(RenderState state) {
+        if (state == null) {
+            return null;
+        }
+        TreeFadeRenderState saved = new TreeFadeRenderState(state);
+        // Wurm's tree states discard every fragment below alpha 0.7. Lower the
+        // threshold and blend only while the ghosted tree is being queued.
+        state.alphatest = Primitive.TestFunc.ALWAYS;
+        state.alphaval = 0.0f;
+        state.blendmode = Primitive.BlendMode.ALPHABLEND;
+        state.depthwrite = false;
+        return saved;
+    }
+
+    private static boolean hasFadedTree(SurfaceCell cell) {
+        Object trees = getFieldValue(cell, "trees");
+        if (!(trees instanceof Map<?, ?>)) {
+            return false;
+        }
+        for (Object value : ((Map<?, ?>) trees).values()) {
+            if (value instanceof TreePosition && getTreeRenderAlpha((TreePosition) value) < 0.999f) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     static float getTreeRenderAlpha(TreePosition tree) {
         if (tree == null) {
             return 1.0f;
@@ -675,21 +865,25 @@ final class CameraOcclusion {
             addRay(rays, cameraX, cameraH, cameraY, targetX, playerH + 1.0f, targetY);
         }
 
-        Set<Long> terrainHoles = buildTerrainHoleTiles(world, layer, cameraH, playerX, playerY, rays);
+        Set<Long> terrainHoles = buildTerrainHoleTiles(world, layer, rays);
         return new Snapshot(world, true, layer, cameraX, cameraH, cameraY,
                 playerX, playerH, playerY, rays,
                 Collections.unmodifiableSet(terrainHoles), surfaceOpeningNearby);
     }
 
-    private static Set<Long> buildTerrainHoleTiles(World world, int layer, float cameraH,
-                                                   float playerX, float playerY, List<Ray> rays) {
+    private static Set<Long> buildTerrainHoleTiles(World world, int layer, List<Ray> rays) {
         Set<Long> result = new HashSet<Long>();
         if (layer >= 0) {
             return result;
         }
         NearTerrainDataBuffer terrain = world.getNearTerrainBuffer();
-        for (Ray ray : rays) {
-            int steps = Math.max(1, (int) Math.ceil(ray.length() / 2.0f));
+        // The first three rays end at the player's feet, torso, and head. The
+        // remaining rays only sample the surrounding play area for object
+        // fading; using them here cuts away terrain beside and behind the player.
+        int playerRayCount = Math.min(3, rays.size());
+        for (int rayIndex = 0; rayIndex < playerRayCount; rayIndex++) {
+            Ray ray = rays.get(rayIndex);
+            int steps = Math.max(1, (int) Math.ceil(ray.length()));
             for (int i = 0; i <= steps; i++) {
                 float t = i / (float) steps;
                 float x = ray.x0 + (ray.x1 - ray.x0) * t;
@@ -702,17 +896,6 @@ final class CameraOcclusion {
                     }
                 } catch (Throwable ignored) {
                     // Skip terrain points that are outside the loaded near-terrain buffer.
-                }
-            }
-        }
-
-        CaveDataBuffer cave = world.getCaveBuffer();
-        int centerX = tileCoordinate(playerX);
-        int centerY = tileCoordinate(playerY);
-        for (int x = centerX - MAX_TERRAIN_HOLE_RADIUS_TILES; x <= centerX + MAX_TERRAIN_HOLE_RADIUS_TILES; x++) {
-            for (int y = centerY - MAX_TERRAIN_HOLE_RADIUS_TILES; y <= centerY + MAX_TERRAIN_HOLE_RADIUS_TILES; y++) {
-                if (isCaveCeilingBelow(cave, x, y, cameraH)) {
-                    result.add(tileKey(x, y));
                 }
             }
         }
@@ -746,18 +929,6 @@ final class CameraOcclusion {
             }
         }
         return false;
-    }
-
-    private static boolean isCaveCeilingBelow(CaveDataBuffer cave, int x, int y, float height) {
-        try {
-            if (!cave.isValid(x * 4.0f, y * 4.0f)) {
-                return false;
-            }
-            float ceiling = cave.getAdjustedCeiling(x, y);
-            return ceiling > -9.0f && height > ceiling + CAVE_CLEARANCE;
-        } catch (Throwable ignored) {
-            return false;
-        }
     }
 
     private static void updateBlockedStructures(World world, Snapshot view) {
@@ -1043,8 +1214,96 @@ final class CameraOcclusion {
         if (!isRelevantLayer(view, layer, x, y, h)) {
             return false;
         }
-        return intersectsViewCorridor(view, x, h, y, x, h, y, renderable.getVolume(),
-                Math.max(0.4f, renderable.getApproximateDiameter() * 0.5f), layer);
+        return intersectsStructureView(view, x, h, y, renderable.getVolume(),
+                Math.max(0.4f, renderable.getApproximateDiameter() * 0.5f));
+    }
+
+    /** Structures fade only when their actual bounds cross a camera-to-player body ray. */
+    private static boolean intersectsStructureView(Snapshot view, float x, float h, float y,
+                                                   Object volumeObject, float fallbackRadius) {
+        if (!view.active) {
+            return false;
+        }
+        if (volumeObject instanceof Volume) {
+            Volume volume = (Volume) volumeObject;
+            if (volume.getSizeX() + volume.getSizeH() + volume.getSizeY() > 0.001f) {
+                Object x0Value = getFieldValue(volume, "x0");
+                Object h0Value = getFieldValue(volume, "h0");
+                Object y0Value = getFieldValue(volume, "y0");
+                Object x1Value = getFieldValue(volume, "x1");
+                Object h1Value = getFieldValue(volume, "h1");
+                Object y1Value = getFieldValue(volume, "y1");
+                if (x0Value instanceof Number && h0Value instanceof Number && y0Value instanceof Number
+                        && x1Value instanceof Number && h1Value instanceof Number
+                        && y1Value instanceof Number) {
+                    float margin = STRUCTURE_CORRIDOR_RADIUS;
+                    float minX = ((Number) x0Value).floatValue() - margin;
+                    float minH = ((Number) h0Value).floatValue() - margin;
+                    float minY = ((Number) y0Value).floatValue() - margin;
+                    float maxX = ((Number) x1Value).floatValue() + margin;
+                    float maxH = ((Number) h1Value).floatValue() + margin;
+                    float maxY = ((Number) y1Value).floatValue() + margin;
+                    int rayCount = Math.min(3, view.rays.size());
+                    for (int i = 0; i < rayCount; i++) {
+                        if (segmentIntersectsBox(view.rays.get(i), minX, minH, minY, maxX, maxH, maxY)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+
+        float radius = fallbackRadius + STRUCTURE_CORRIDOR_RADIUS;
+        float radiusSquared = radius * radius;
+        int rayCount = Math.min(3, view.rays.size());
+        for (int i = 0; i < rayCount; i++) {
+            if (distanceSquaredToSegment(view.rays.get(i), x, h, y) <= radiusSquared) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean segmentIntersectsBox(Ray ray, float minX, float minH, float minY,
+                                                float maxX, float maxH, float maxY) {
+        float[] interval = {0.015f, 0.985f};
+        return clipSegmentAxis(ray.x0, ray.x1 - ray.x0, minX, maxX, interval)
+                && clipSegmentAxis(ray.h0, ray.h1 - ray.h0, minH, maxH, interval)
+                && clipSegmentAxis(ray.y0, ray.y1 - ray.y0, minY, maxY, interval);
+    }
+
+    private static boolean clipSegmentAxis(float origin, float direction, float minimum,
+                                           float maximum, float[] interval) {
+        if (Math.abs(direction) < 0.0001f) {
+            return origin >= minimum && origin <= maximum;
+        }
+        float first = (minimum - origin) / direction;
+        float second = (maximum - origin) / direction;
+        if (first > second) {
+            float swap = first;
+            first = second;
+            second = swap;
+        }
+        interval[0] = Math.max(interval[0], first);
+        interval[1] = Math.min(interval[1], second);
+        return interval[0] <= interval[1];
+    }
+
+    private static float distanceSquaredToSegment(Ray ray, float x, float h, float y) {
+        float dx = ray.x1 - ray.x0;
+        float dh = ray.h1 - ray.h0;
+        float dy = ray.y1 - ray.y0;
+        float lengthSquared = dx * dx + dh * dh + dy * dy;
+        if (lengthSquared < 0.001f) {
+            return Float.POSITIVE_INFINITY;
+        }
+        float t = ((x - ray.x0) * dx + (h - ray.h0) * dh + (y - ray.y0) * dy) / lengthSquared;
+        t = Math.max(0.015f, Math.min(0.985f, t));
+        float ox = x - (ray.x0 + t * dx);
+        float oh = h - (ray.h0 + t * dh);
+        float oy = y - (ray.y0 + t * dy);
+        return ox * ox + oh * oh + oy * oy;
     }
 
     private static boolean isRelevantLayer(Snapshot view, int layer, float x, float y, float h) {
@@ -1209,6 +1468,22 @@ final class CameraOcclusion {
             this.appliedAlpha = alpha;
             this.appliedTransparent = false;
             this.hasApplied = false;
+        }
+    }
+
+    private static final class TreeFadeRenderState {
+        private final RenderState state;
+        private final Primitive.TestFunc alphaTest;
+        private final float alphaValue;
+        private final Primitive.BlendMode blendMode;
+        private final boolean depthWrite;
+
+        private TreeFadeRenderState(RenderState state) {
+            this.state = state;
+            this.alphaTest = state.alphatest;
+            this.alphaValue = state.alphaval;
+            this.blendMode = state.blendmode;
+            this.depthWrite = state.depthwrite;
         }
     }
 
