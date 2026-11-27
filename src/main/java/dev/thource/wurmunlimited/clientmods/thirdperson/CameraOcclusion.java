@@ -49,10 +49,10 @@ import java.util.logging.Logger;
 final class CameraOcclusion {
     private static final Logger LOGGER = Logger.getLogger(CameraOcclusion.class.getName());
     private static final float OCCLUDER_TRANSPARENCY = 0.72f;
-    private static final float PRETTY_TREE_FADE_MAX = 0.55f;
+    private static final float PRETTY_TREE_FADE_MAX = 0.60f;
     private static final float GHOST_STRUCTURE_ALPHA = 0.18f;
-    private static final float CORRIDOR_RADIUS = 0.75f;
     private static final float STRUCTURE_CORRIDOR_RADIUS = 0.25f;
+    private static final float TREE_VIEW_MARGIN = 0.15f;
     private static final float PLAY_AREA_RADIUS = 3.5f;
     private static final float CAVE_CLEARANCE = 0.35f;
     private static final String[] RENDERABLE_LISTS = {
@@ -731,9 +731,7 @@ final class CameraOcclusion {
             if (!isRelevantLayer(view, 0, tree.getX(), tree.getY(), tree.getH())) {
                 return false;
             }
-            Object volume = getFieldValue(tree, "volume");
-            return intersectsViewCorridor(view, tree.getX(), tree.getH(), tree.getY(),
-                    tree.getX(), tree.getH(), tree.getY(), volume, 1.0f, 0);
+            return intersectsTreeView(view, tree);
         } catch (Throwable t) {
             logOnce("treeRead", "Unable to read tree bounds for camera cutaway", t);
             return false;
@@ -1218,6 +1216,108 @@ final class CameraOcclusion {
                 Math.max(0.4f, renderable.getApproximateDiameter() * 0.5f));
     }
 
+    /** Trees fade only when their rendered bounds cross a camera-to-player body ray. */
+    private static boolean intersectsTreeView(Snapshot view, TreePosition tree) {
+        float minX;
+        float minH;
+        float minY;
+        float maxX;
+        float maxH;
+        float maxY;
+        Object volumeObject = getFieldValue(tree, "volume");
+        if (volumeObject instanceof Volume) {
+            Volume volume = (Volume) volumeObject;
+            if (volume.getSizeX() + volume.getSizeH() + volume.getSizeY() > 0.001f) {
+                Object x0Value = getFieldValue(volume, "x0");
+                Object h0Value = getFieldValue(volume, "h0");
+                Object y0Value = getFieldValue(volume, "y0");
+                Object x1Value = getFieldValue(volume, "x1");
+                Object h1Value = getFieldValue(volume, "h1");
+                Object y1Value = getFieldValue(volume, "y1");
+                if (x0Value instanceof Number && h0Value instanceof Number && y0Value instanceof Number
+                        && x1Value instanceof Number && h1Value instanceof Number
+                        && y1Value instanceof Number) {
+                    minX = ((Number) x0Value).floatValue();
+                    minH = ((Number) h0Value).floatValue();
+                    minY = ((Number) y0Value).floatValue();
+                    maxX = ((Number) x1Value).floatValue();
+                    maxH = ((Number) h1Value).floatValue();
+                    maxY = ((Number) y1Value).floatValue();
+                } else {
+                    return false;
+                }
+            } else {
+                float width = readBillboardTreeDimension(tree, "xScale", "treeImageWidth");
+                float height = readBillboardTreeDimension(tree, "hScale", "treeImageHeight");
+                if (width <= 0.0f || height <= 0.0f) {
+                    return false;
+                }
+                float x = tree.getX();
+                float h = tree.getH();
+                float y = tree.getY();
+                Object offsetValue = getFieldValue(tree, "distanceVertexOffsetH");
+                float offset = offsetValue instanceof Number
+                        ? ((Number) offsetValue).floatValue() : 1.0f;
+                float halfWidth = width * 0.5f;
+                minX = x - halfWidth;
+                minH = h - offset;
+                minY = y - halfWidth;
+                maxX = x + halfWidth;
+                maxH = h - offset + height;
+                maxY = y + halfWidth;
+            }
+        } else {
+            return false;
+        }
+
+        // Limit tree tiles to the camera-facing half of the player's ground
+        // plane. The canopy bounds below handle steep views and vertical overlap.
+        if (!pointIsOnCameraSideOfPlayer(view,
+                tree.getX(), tree.getY())) {
+            return false;
+        }
+
+        float margin = TREE_VIEW_MARGIN;
+        minX -= margin;
+        minH -= margin;
+        minY -= margin;
+        maxX += margin;
+        maxH += margin;
+        maxY += margin;
+        int rayCount = Math.min(3, view.rays.size());
+        for (int i = 0; i < rayCount; i++) {
+            if (segmentIntersectsBox(view.rays.get(i), minX, minH, minY, maxX, maxH, maxY)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static float readBillboardTreeDimension(TreePosition tree, String scaleField,
+                                                   String imageDimensionField) {
+        Object scaleValue = getFieldValue(tree, scaleField);
+        Object imageDimensionValue = getFieldValue(tree, imageDimensionField);
+        if (!(scaleValue instanceof Number) || !(imageDimensionValue instanceof Number)) {
+            return 0.0f;
+        }
+        float imageDimension = ((Number) imageDimensionValue).floatValue();
+        return imageDimension > 0.001f
+                ? ((Number) scaleValue).floatValue() / imageDimension : 0.0f;
+    }
+
+    private static boolean pointIsOnCameraSideOfPlayer(Snapshot view, float x, float y) {
+        float towardCameraX = view.cameraX - view.playerX;
+        float towardCameraY = view.cameraY - view.playerY;
+        if (towardCameraX * towardCameraX + towardCameraY * towardCameraY < 0.001f) {
+            // A directly overhead camera has no ground-plane direction. The
+            // rendered tree bounds still must cross a direct body ray below.
+            return true;
+        }
+        float fromPlayerX = x - view.playerX;
+        float fromPlayerY = y - view.playerY;
+        return fromPlayerX * towardCameraX + fromPlayerY * towardCameraY >= 0.0f;
+    }
+
     /** Structures fade only when their actual bounds cross a camera-to-player body ray. */
     private static boolean intersectsStructureView(Snapshot view, float x, float h, float y,
                                                    Object volumeObject, float fallbackRadius) {
@@ -1316,61 +1416,6 @@ final class CameraOcclusion {
                 return surface > -9.0f && view.cameraH > surface + 0.5f;
             } catch (Throwable ignored) {
                 return false;
-            }
-        }
-        return false;
-    }
-
-    private static boolean intersectsViewCorridor(Snapshot view,
-                                                  float fallbackX, float fallbackH, float fallbackY,
-                                                  float objectX, float objectH, float objectY,
-                                                  Object volumeObject, float extraRadius, int layer) {
-        if (!view.active) {
-            return false;
-        }
-        float x = fallbackX;
-        float h = fallbackH;
-        float y = fallbackY;
-        float radius = Math.max(0.0f, extraRadius);
-        if (volumeObject instanceof Volume) {
-            Volume volume = (Volume) volumeObject;
-            float sx = volume.getSizeX();
-            float sh = volume.getSizeH();
-            float sy = volume.getSizeY();
-            if (sx + sh + sy > 0.001f) {
-                x = volume.getCenterX();
-                h = volume.getCenterH();
-                y = volume.getCenterY();
-                radius = Math.max(radius, (float) Math.sqrt(sx * sx + sh * sh + sy * sy) * 0.5f);
-            } else {
-                x = objectX;
-                h = objectH;
-                y = objectY;
-            }
-        }
-
-        float limit = radius + CORRIDOR_RADIUS;
-        float limitSquared = limit * limit;
-        for (Ray ray : view.rays) {
-            float dx = ray.x1 - ray.x0;
-            float dh = ray.h1 - ray.h0;
-            float dy = ray.y1 - ray.y0;
-            float lengthSquared = dx * dx + dh * dh + dy * dy;
-            if (lengthSquared < 0.001f) {
-                continue;
-            }
-            float t = ((x - ray.x0) * dx + (h - ray.h0) * dh + (y - ray.y0) * dy) / lengthSquared;
-            if (t < 0.015f || t > 0.985f) {
-                continue;
-            }
-            float closestX = ray.x0 + t * dx;
-            float closestH = ray.h0 + t * dh;
-            float closestY = ray.y0 + t * dy;
-            float ox = x - closestX;
-            float oh = h - closestH;
-            float oy = y - closestY;
-            if (ox * ox + oh * oh + oy * oy <= limitSquared) {
-                return true;
             }
         }
         return false;
